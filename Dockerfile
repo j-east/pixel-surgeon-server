@@ -9,9 +9,11 @@ RUN useradd -m -u 1987 mcp
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+RUN npm ci
 
-COPY dist/ dist/
+COPY src/ src/
+COPY tsconfig.json ./
+RUN npx tsc && npm prune --omit=dev
 
 USER mcp
 
