@@ -35,13 +35,43 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-function checkAuth(req: IncomingMessage, res: ServerResponse): boolean {
-  if (req.headers.authorization !== `Bearer ${API_KEY}`) {
-    res.writeHead(401, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Unauthorized" }));
-    return false;
-  }
-  return true;
+function checkAuth(req: IncomingMessage, res: ServerResponse, url?: URL): boolean {
+  const keyParam = url?.searchParams.get("key");
+  if (keyParam === API_KEY) return true;
+  if (req.headers.authorization === `Bearer ${API_KEY}`) return true;
+  res.writeHead(401, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "Unauthorized" }));
+  return false;
+}
+
+function esc(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function imagePage(record: ImageRecord, details: string): string {
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>pixel-surgeon — ${esc(record.prompt.slice(0, 60))}</title>
+<style>
+  body { margin: 0; background: #1a1a1a; color: #ccc; font-family: system-ui; display: flex; flex-direction: column; align-items: center; padding: 16px; }
+  img { max-width: 100%; border-radius: 6px; margin: 16px 0; }
+  .prompt { background: #252525; color: #bbb; border: 1px solid #444; padding: 12px; border-radius: 6px; max-width: 600px; width: 100%; font-size: 14px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+  .meta { color: #666; font-size: 12px; margin-top: 8px; }
+  h1 { font-size: 16px; color: #8bc4ff; margin: 8px 0; }
+</style></head><body>
+<h1>pixel-surgeon</h1>
+<div class="prompt">${esc(record.prompt)}</div>
+<img src="/images/${esc(record.filename)}" alt="${esc(record.prompt.slice(0, 100))}">
+<div class="meta">${esc(record.model)} · ${esc(record.filename)}${details ? " · " + esc(details.slice(0, 200)) : ""}</div>
+</body></html>`;
+}
+
+function errorPage(title: string, detail: string): string {
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>pixel-surgeon — error</title>
+<style>body { margin: 40px; background: #1a1a1a; color: #ccc; font-family: system-ui; } h1 { color: #f44336; font-size: 18px; } p { color: #999; }</style>
+</head><body><h1>${esc(title)}</h1><p>${esc(detail)}</p></body></html>`;
 }
 
 interface ImageRecord {
@@ -269,9 +299,102 @@ async function main() {
       return;
     }
 
-    if (!checkAuth(req, res)) return;
+    // GET endpoints — auth via ?key= query param
+    if (url.pathname === "/api/generate" && req.method === "GET") {
+      if (!checkAuth(req, res, url)) return;
+      const prompt = url.searchParams.get("prompt");
+      if (!prompt) {
+        res.writeHead(400, { "Content-Type": "text/html" });
+        res.end(errorPage("Missing prompt", "Add ?prompt=your+description to the URL."));
+        return;
+      }
+      try {
+        log(`GET generate: "${prompt.slice(0, 80)}"`);
+        const aspect_ratio = url.searchParams.get("aspect_ratio") || undefined;
+        const image_size = url.searchParams.get("image_size") || undefined;
+        const model = url.searchParams.get("model") || undefined;
+        const style = url.searchParams.get("style") || undefined;
+        const result = await client.callTool({
+          name: "generate_image",
+          arguments: {
+            prompt,
+            ...(aspect_ratio && { aspect_ratio }),
+            ...(image_size && { image_size }),
+            ...(model && { model }),
+            ...(style && { style }),
+          },
+        }) as { content: Array<{ type: string; data?: string; mimeType?: string; text?: string }> };
+        const images = extractImagesFromResult(result);
+        const text = extractTextFromResult(result);
+        if (images.length === 0) {
+          res.writeHead(500, { "Content-Type": "text/html" });
+          res.end(errorPage("No image generated", text));
+          return;
+        }
+        const record = await saveImage(images[0].base64, images[0].mime, prompt, model || "default");
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end(imagePage(record, text));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log(`GET generate error: ${msg}`);
+        res.writeHead(500, { "Content-Type": "text/html" });
+        res.end(errorPage("Generation failed", msg));
+      }
+      return;
+    }
 
-    // REST API
+    if (url.pathname === "/api/edit" && req.method === "GET") {
+      if (!checkAuth(req, res, url)) return;
+      const filename = url.searchParams.get("filename");
+      const prompt = url.searchParams.get("prompt");
+      if (!filename || !prompt) {
+        res.writeHead(400, { "Content-Type": "text/html" });
+        res.end(errorPage("Missing params", "Both filename and prompt are required."));
+        return;
+      }
+      try {
+        log(`GET edit: "${prompt.slice(0, 80)}" on ${filename}`);
+        const aspect_ratio = url.searchParams.get("aspect_ratio") || undefined;
+        const image_size = url.searchParams.get("image_size") || undefined;
+        const model = url.searchParams.get("model") || undefined;
+        const result = await client.callTool({
+          name: "edit_image",
+          arguments: {
+            filename,
+            prompt,
+            ...(aspect_ratio && { aspect_ratio }),
+            ...(image_size && { image_size }),
+            ...(model && { model }),
+          },
+        }) as { content: Array<{ type: string; data?: string; mimeType?: string; text?: string }> };
+        const images = extractImagesFromResult(result);
+        const text = extractTextFromResult(result);
+        if (images.length === 0) {
+          res.writeHead(500, { "Content-Type": "text/html" });
+          res.end(errorPage("No image generated", text));
+          return;
+        }
+        const record = await saveImage(images[0].base64, images[0].mime, prompt, model || "default");
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end(imagePage(record, text));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log(`GET edit error: ${msg}`);
+        res.writeHead(500, { "Content-Type": "text/html" });
+        res.end(errorPage("Edit failed", msg));
+      }
+      return;
+    }
+
+    if (url.pathname === "/api/images" && req.method === "GET") {
+      if (!checkAuth(req, res, url)) return;
+      await handleApiImages(res);
+      return;
+    }
+
+    // POST endpoints — auth via Authorization header
+    if (!checkAuth(req, res, url)) return;
+
     if (url.pathname === "/api/generate" && req.method === "POST") {
       await handleApiGenerate(req, res);
       return;
@@ -279,11 +402,6 @@ async function main() {
 
     if (url.pathname === "/api/edit" && req.method === "POST") {
       await handleApiEdit(req, res);
-      return;
-    }
-
-    if (url.pathname === "/api/images" && req.method === "GET") {
-      await handleApiImages(res);
       return;
     }
 
